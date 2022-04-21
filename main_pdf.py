@@ -2,11 +2,11 @@ import time
 import board
 import busio
 import adafruit_bmp3xx
+import adafruit_adxl34x
 import cv2 as cv
 import pickle
 import sys
 import os
-import serial
 from collections import Counter
 from adafruit_motor import stepper
 from adafruit_motorkit import MotorKit
@@ -30,7 +30,7 @@ WIND_DIR = 2.443460    # in radians (0 to 2Pi); E = 0; CCW; {Cos(t), Sin(t)}
 TIME_INT = 0.1
 
 DIRECTORY = 'photos'
-PATH = '/home/ara/PDF_launch/photos'
+PATH = '/home/pi/PDF_launch/photos'
 
 # /* Calculates height(pressure) :
 #  *		P = P0 * exp(-ghM/RT)
@@ -62,7 +62,7 @@ def actual_height_ft(p, h_inv):
 
 def rotate_motor(direction):
     # for i in range(NUM_ROTATIONS * STEPS_PER_ROTATION):
-    for i in range(225):
+    for i in range(250):
         motors.stepper2.onestep(style=stepper.DOUBLE, direction=direction)
 
 # Image recognition function
@@ -85,19 +85,87 @@ def findPossibleLocations(detection_image):
         points.append(p2)
     grid_space = []
     for point in points:
-        x = str(int(point[0]/300)+1).zfill(2)
-        y = str(int(point[1]/300)+65).zfill(2)
-        grid_space.append(y+x)
-    top_placements = (Counter(grid_space).most_common(1))
+        x = int(point[0]/400)+1
+        y = int(point[1]/400)
+        grid_space.append(chr(y+65)+str(x))
+    top_placements = (Counter(grid_space).most_common(4))
     location_output = []
     for items in top_placements:
         location_output.append(items[0])
-    final_string = ""
-    for items in location_output:
-        final_string+=items
-    return final_string
+    return location_output
 
-# Set up MPL. Yes it's that fucking easy
+# BEN'S MATH STUFF (formerly tracking.h)
+
+def getTheta(theta, WY, CY, WX, CX, R, time): # R is a constant, the radius of the rocket cross section
+    sign = 1
+    if (WY - CY) < 0:
+        sign = -1
+
+    return theta + (sign * sqrt((WX - CX) / R) * time) # Radians
+
+def getTau(tau, CX, CY, theta, DtoCG, time):
+    return tau + (0.5 * ((CX * cos(theta) - CY * sin(theta)) / DtoCG) * pow(time, 2)) # Might be better methods we'll see
+
+def getPhi(phi, CX, CY, theta, DtoCG, time):
+    return phi + (0.5 * ((CX * sin(theta) + CY * cos(theta)) / DtoCG) * pow(time, 2)) # Might be better methods we'll see
+
+def recalibrateAcc(AX, AY, AZ, theta, phi): # Accounts for changing axes and converts g to ft/s^2
+    GFTSS = 32.174
+    AZ2 = (AZ - sin(phi)) * GFTSS
+    AX2 = (AX - sin(theta) * cos(phi)) * GFTSS
+    AY2 = (AY - cos(theta) * cos(phi)) * GFTSS
+
+    return (AX2, AY2, AZ2)
+
+def getVAndXY(V, X, Y, CZ, tau, phi, time):
+    V2 = V + (CZ * time)
+    X2 = X2 + (V * cos(phi) * cos(tau) * time)
+    Y2 = Y2 + (V * cos(phi) * sin(tau) * time)
+
+    return (V2, X2, Y2)
+
+def getDeplV(VX, VY, V, phi, tau):
+    VX2 = V * cos(phi) * cos(tau)
+    VY2 = V * cos(phi) * sin(tau)
+
+    return (VX2, VY2)
+
+def predictGS(X, Y, VX, VY, weirdConst, WindSpeed, WindDir, time):
+    # iterate time2 to account for time passed, pass same stuff for main parachute call
+    VX2 = VX
+    VY2 = VY
+    X2 = X
+    Y2 = Y
+    for _ in range(26):
+        VX2 -= weirdConst * time * pow(VX2 - WindSpeed * cos(WindDir), 2)
+        VY2 -= weirdConst * time * pow(VY2 - WindSpeed * sin(WindDir), 2)
+        X2 = VX2 * time
+        Y2 = VY2 * time
+
+    X2 += 2000
+    Y2 += 2000
+
+    gs = str(chr(int(X2 / 200) + 65)) + str(int(Y2 / 200))
+    
+    return (gs, X2, Y2, VX2, VY2)
+
+def GetApproxV(VX, VY, weirdConst, WindSpeed, WindDir, time):
+    VX2 = VX - weirdConst * time * pow(*VX - WindSpeed * cos(WindDir), 2)
+    VY2 = VY - weirdConst * time * pow(*VY - WindSpeed * sin(WindDir), 2)
+
+    return (VX2, VY2)
+
+def GetXYafterAp(X, Y, VX, VY, time):
+    return (VX * time, VY * time) # (X, Y) = return
+
+def GetGridSquare(X, Y):
+    X2 = X + 2000
+    Y2 = Y + 2000
+
+    return str(chr(int(X2 / 200) + 65)) + str(int(Y2 / 200))
+
+
+# Set up MPL/BMP. Yes it's that fking easy
 # Call mpl.pressure (not a function)
 
 # i2c = busio.I2C(board.SCL, board.SDA)
@@ -109,8 +177,10 @@ bmp = adafruit_bmp3xx.BMP3XX_I2C(i2c)
 
 motors = MotorKit(address=0x61)
 
-# Set up ADXLs, maybe
+# Set up ADXLs
 
+adxl_main = adafruit_adxl34x.ADXL345(i2c, address=0x53)
+adxl_alt = adafruit_adxl34x.ADXL345(i2c, address=0x1D)
 
 # Initialize image recognition
 
@@ -127,6 +197,18 @@ sift = cv.SIFT_create()
 
 # main
 
+# Ben's variables
+theta = -3.14159 / 2.0
+tau = -0.6981317 # user input
+phi = 3.14159 / 2.0 # todo user input
+radius = 0.25
+DtoCG = 2.4375 # TODO: MAKE CORRECT
+v = 0
+X = 0
+Y = 0
+VX = 0
+VY = 0
+
 calibrated = 0
 curTime = 0
 apogeeTime = 0
@@ -139,8 +221,8 @@ motor_p2 = 0
 pressure = 0
 filename = 0
 outfile = 'LAUNCH_DAY_WOOOO'
-    
-f = open('/home/ara/PDF_launch/' + str(int(time.time())) + '.txt', 'a')
+
+f = open('/home/pi/PDF_launch/' + str(int(time.time())) + '.txt', 'w')
 
 f.write('Begin main()\n')
 
@@ -151,23 +233,64 @@ pressure = bmp.pressure / 10
 for i in range(10 - 1): # list size of 2, fill all but one slot MAKE THIS 10 - 1 FOR ACTUAL MAIN.PY
     pressures.append(pressure) # ABSOLUTELY GET RID OF THE / 1000 FOR ACTUAL LAUNCH IF MPL READS KPA
 
-('Begin while()\n\n')
+f.write('Begin while()\n\n')
 
 while True:
+    if launched == 1 and (motor_p1 == 0 or motor_p2 == 1):
+        motors.stepper2.onestep(style=stepper.DOUBLE, direction=stepper.BACKWARD) # janky ass method to keep motor retention
+
     pressure = bmp.pressure / 10 # SAME HERE AS ABOVE
+    
+    (x_main, y_main, z_main) = adxl_main.acceleration
+    (x_alt, y_alt, z_alt) = adxl_alt.acceleration
+
+    # THIS BLOCK DEFINITELY NEEDS TO CHANGE BASED ON THE POSITION OF THE SENSORS IN THE ROCKET
+    # ALSO MAKE SURE YOU CHANGE THE DISTANCE TO THE CENTER OF GRAVITY
+    x_main *= FT_PER_METER
+    y_main *= FT_PER_METER
+    z_main *= FT_PER_METER
+    x_alt *= FT_PER_METER
+    y_alt *= FT_PER_METER
+    z_alt *= FT_PER_METER
 
     pressures.append(pressure)
 
     if not calibrated:
         height_offset = height_calibration(pressures[-1]) # ZEROED IN BASED ON THE FIRST PRESSURE VALUE READ IN SO YOU BETTER HOPE WE TURN THIS MF ON AT THE LAUNCH SITE'S ALTITUDE
         calibrated = 1
-    
+
     height = actual_height_ft(pressure, height_offset) # HEIGHT ABOVE GROUND LEVEL
     previous_height = actual_height_ft(pressures[0], height_offset) # HEIGHT ABOVE GROUND LEVEL 1 SECOND AGO
     pressures.pop(0)
 
     # define ADXL vars here and read
-    # if launched, recalibrate accel for both ADXLs, get theta, tau, and phi, and get v and xy
+    (x_main, y_main, z_main) = adxl_main.acceleration
+    (x_alt, y_alt, z_alt) = adxl_alt.acceleration
+
+    # ADJUST THIS BLOCK BASED ON WHAT BEN SAYS (BASED ON POSITION WITHIN THE ROCKET)
+    x_main *= FT_PER_METER
+    y_main *= FT_PER_METER
+    z_main *= FT_PER_METER
+    x_alt *= FT_PER_METER
+    y_alt *= FT_PER_METER
+    z_alt *= FT_PER_METER
+
+
+
+
+
+
+    # ADJUST BASED ON ORIENTATION WITHIN ROCKET
+
+
+
+
+
+
+
+
+
+
 
     # 1. Launch
     #      1b. Based on sims 75 feet clears the resting pressure variance and is realistic to rocket flight
@@ -175,22 +298,30 @@ while True:
         f.write('\n\nROCKET LAUNCHED\n\n')
         launched = 1 # launched
 
+    # if launched, recalibrate accel for both ADXLs, get theta, tau, and phi, and get v and xy
+    if launched == 1:
+        (x_main, y_main, z_main, theta, phi) = recalibrateAcc(x_main, y_main, z_main, theta, phi)
+        (x_alt, y_alt, z_alt, theta, phi) = recalibrateAcc(x_alt, y_alt, z_alt, theta, phi)
+        theta = getTheta(theta, y_alt, y_main, x_alt, x_main, radius, TIME_INT)
+        tau = getTau(tau, x_main, y_main, theta, DtoCG, TIME_INT)
+        phi = getPhi(phi, x_main, y_main, theta, DtoCG, TIME_INT)
+        (v, X, Y) = getVAndXY(v, X, Y, z_main, tau, phi, TIME_INT)
+
     # 2. Apogee
     if apogee == 0 and launched == 1 and height < previous_height:
         # get deplv
         f.write('\n\nAPOGEE\n\n')
         apogee = 1
+        (VX, VY) = getDeplV(VX, VY, v, phi, tau)
 
-    # if (apogee == 1 && motor_p1 == 0) {
-    #     GetApproxV(&VX, &VY, DROG_CHUTE_CONSTANT, WIND_SPEED, WIND_DIR, TIME_INT); // TODO replace constants
-    #     GetXYafterAp(&X, &Y, VX, VY, TIME_INT);
-    # }
+    if apogee == 1 and motor_p1 == 0:
+        (VX, VY) = GetApproxV(VX, VY, DROG_CHUTE_CONSTANT, WIND_SPEED, WIND_DIR, TIME_INT)
+        (X, Y) = GetXYafterAp(X, Y, VX, VY, TIME_INT)
 
-    # if (motor_p1 == 1 && height > 0) {
-    #     GetApproxV(&VX, &VY, MAIN_CHUTE_CONSTANT, WIND_SPEED, WIND_DIR, TIME_INT); // TODO replace constants
-    #     GetXYafterAp(&X, &Y, VX, VY, TIME_INT);
-    # }
-    
+    if motor_p1 == 1 and height > 0:
+        (VX, VY) = GetApproxV(VX, VY, MAIN_CHUTE_CONSTANT, WIND_SPEED, WIND_DIR, TIME_INT)
+        (X, Y) = GetXYafterAp(X, Y, VX, VY, TIME_INT)
+
     # 3. Main Parachute Deployment
     if motor_p1 == 0 and apogee == 1 and height <= 600: # needs to be <= because the chances of it being exactly 500 are almost guaranteed zero
         # // sticka da motor out
@@ -203,11 +334,13 @@ while True:
         rotate_motor(stepper.FORWARD) # CHECK THIS, COULD BE stepper.BACKWARD TO BEGIN
         motor_p1 = 1
         # predictgs and write to file
+        gridSquare = predictGS(X, Y, VX, VY, MAIN_CHUTE_CONSTANT, WIND_SPEED, WIND_DIR, TIME_INT)
+        f.write('Predicted Grid Square : ' + gridSquare + '\n\n')
 
     # 3.5. Taking a picture
     if motor_p1 == 1 and motor_p2 == 0 and filename < 10:
-        if not timeSinceLaunch % 20: # every 2 seconds
-            command = 'libcamera-still -o ' + PATH + '/' + str(filename) + '.jpg -t 1 --shutter 9000 -n --autofocus --width 2448 --height 3264' # save as %d.jpg
+        if not timeSinceLaunch % 10: # every 5 seconds
+            command = 'raspistill -o ' + PATH + '/' + str(filename) + '.jpg -t 1 --shutter 3000 -n' # save as %d.jpg
             os.system(command)
             filename += 1
 
@@ -222,8 +355,10 @@ while True:
 
     # 5. Actually Landed
     if abs(height - previous_height) < 30 and motor_p2 == 1:
-        ('\n\nLANDED\n\n')
+        f.write('\n\nLANDED\n\n')
         # getgridsquare
+        AAAAAAA = GetGridSquare(X, Y)
+        f.write('Actual Grid Square : ' + AAAAAAA + '\n\n')
         # write to file
         # send to arduino
         break
@@ -236,8 +371,10 @@ while True:
     f.write('\n')
 
     # output to log
-    f.write('Pressure: {} \tHeight: {}'.format(pressure, height))
-    
+    if not curTime % 5:
+        f.write('Pressure: {} \tHeight: {}'.format(pressure, height))
+        f.write('Main: ({}, {}, {}) \tAlt: ({}, {}, {})'.format(x_main, y_main, z_main, x_alt, y_alt, z_alt))
+
     time.sleep(0.1) # loop every decisecond
 
 
@@ -256,16 +393,5 @@ for filename in os.listdir(PATH):
 # for _ in range(5):
 #     for i in range(len(locations)):
 #         # send final location to arduino
-ser = serial.Serial('/dev/ttyACM0', 38400, timeout=1)
-ser.reset_input_buffer()
-for dataLocations in locations:
-    for sendingData in range(5):
-        ser.write(bytes(dataLocations, 'UTF-8'))
-        time.sleep(1)
-    for sendingData in range(3):
-        ser.write(bytes("1111", 'UTF-8'))
-        time.sleep(1)
-
-    
 
 f.close()
